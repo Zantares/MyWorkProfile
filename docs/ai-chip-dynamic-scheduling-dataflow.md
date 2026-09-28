@@ -22,7 +22,7 @@
 > 数据流 = 静态编译框架 + 受限动态调度  
 > 乱序一类 = 弱拓扑约束 + 高自由度、高开销动态调度
 
-二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。
+二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。TPU 一类设计即少做 cache / 分支预测 / 乱序，把晶体管更多留给矩阵与片上缓冲，并报出相对同期 CPU/GPU 更高的能效比（见文末参考）。
 
 两者都依赖调度，因而都碰到：**调度器一次能看见、能挖的有效计算图有多大？**
 
@@ -39,6 +39,8 @@
 | **融合 / 子图放大** | 多 op 进入同一调度域 | 实现难；过大可能超窗 |
 | **CUDA Graphs 等** | 一次提交多节点，利于无依赖重叠 | 不等于更大的 op 级调度窗 |
 | **PDL 等依赖核重叠** | 压依赖边界气泡、提高 prefetch | 域仍碎；有硬件代数边界 |
+
+（CUDA Graphs 与 kernel fusion 分层、以及 Hopper+ 的 PDL，见文末参考。）
 
 ### 2. 图太大：编译可得，窗口会超
 
@@ -71,7 +73,7 @@
 
 **链式依赖、共享片上 SRAM** 的串行算子宜同块或邻块。若只按「无依赖」拆散链条，中间结果易下刷 DDR，放大访存代价。
 
-> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前。
+> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前。FlashAttention 一类工作即通过 tiling 与融合减少 HBM 往返，把依赖链留在更快的片上层次（见文末参考）。
 
 这样的块由谁来构造——手写，还是编译器融合？
 
@@ -87,7 +89,7 @@
 
 自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。
 
-二者互补：热点手写，长尾与切分/换代靠编译。构图交给软件后，还要问：软件扛多少复杂度，硬件换回多少能效与密度？
+二者互补：热点手写，长尾与切分/换代靠编译（如 TVM / XLA 的融合，以及 `torch.compile` 等自动构图，见文末参考）。构图交给软件后，还要问：软件扛多少复杂度，硬件换回多少能效与密度？
 
 ## 五、无银弹：软件与硬件的分工
 
@@ -148,6 +150,8 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 | **主要对象** | 面向超节点的互联协议与参考架构 | AI 芯片与片间/超节点互联（如 ICN）及整机协同 |
 | **常强调的能力** | 总线级互联、协议归一、资源池化；多机在逻辑上更接近一台机器 | 统一内存编址与内存语义、域内高带宽低时延；再经数据中心网络扩展规模 |
 
+（发布说明与技术解读链接见文末参考。集群侧存储/通信/并行调度的系统约束，亦可对照 DeepSpeed Inference 等公开分析。）
+
 ### 4. 收束
 
 单片打满是必要基础；通信、存储与分布式 Infra 往往划出集群出口上限；二者相连。仍可追问：并行切割下如何保住局部性？硬件与协议如何让「多卡像一域」付得起代价？
@@ -159,4 +163,31 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 3. 手写与编译器互补构图；软件负重、硬件解放，形态多样。
 4. 超节点下，单片是入场券，通信、存储与 Infra 常定出口上限；单片与集群宜一起设计。
 
-> （注：部分内容可能由 AI 生成）
+## 参考（按章，各 1–2 条）
+
+1. **动态调度 / 数据流**  
+   - Jouppi et al., *In-Datacenter Performance Analysis of a Tensor Processing Unit*, ISCA 2017: https://arxiv.org/pdf/1704.04760  
+   - Google Cloud, *An in-depth look at Google’s first Tensor Processing Unit (TPU)*: https://cloud.google.com/blog/products/ai-machine-learning/an-in-depth-look-at-googles-first-tensor-processing-unit-tpu  
+
+2. **窗口与图 / 提交与跨核**  
+   - NVIDIA, *Getting Started with CUDA Graphs*: https://developer.nvidia.com/blog/cuda-graphs/  
+   - NVIDIA, *Kernel Fusion in NVIDIA CUDA…*（Graphs 与 fusion 分层）: https://developer.nvidia.com/blog/kernel-fusion-in-nvidia-cuda-optimizing-memory-traffic-and-launch-overhead/  
+   - NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*: https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
+
+3. **局部性与融合**  
+   - Dao et al., *FlashAttention*: https://arxiv.org/abs/2205.14135  
+
+4. **手写 vs 编译构图**  
+   - Apache TVM, *Operator Fusion*: https://tvm.apache.org/docs/arch/fusion.html  
+   - PyTorch, *PyTorch 2.0*（`torch.compile`）: https://pytorch.org/blog/pytorch-2.0-release/  
+
+5. **软硬件分工**  
+   - 同第 1 组 TPU 论文 / 博客（编译期与确定性执行换面积与能效）。  
+
+6. **超节点与系统层**  
+   - 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*（灵衢）: https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
+   - 华为, *发布全球最强算力超节点和集群*: https://www.huawei.com/cn/news/2025/9/hc-lingqu-ai-superpod  
+   - 阿里云开发者社区等对真武 V900 / 超节点与 ICN 的公开介绍（2026 云栖前后）: https://developer.aliyun.com/article/1765525  
+   - Aminabadi et al., *DeepSpeed Inference*（大规模推理中的通信、PP、KV 等）: https://ar5iv.labs.arxiv.org/html/2207.00032  
+
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，行业材料具时效性。）
