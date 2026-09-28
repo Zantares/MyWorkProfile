@@ -30,17 +30,17 @@
 
 调度窗口指一次处于「可调度 / 在途」的**指令或 op** 范围（有别于 shared mem / 显存等存储上限），深度多在微架构或编译器内部，开发者不易直接看见。有效图宜落在窗口能吃饱、软硬件又扛得住的区间。
 
-公开材料里，**「图级调度窗 = N 个 op」这类厂商规格很少直接给出**。更常见的定量是旁证：CPU 乱序的指令窗通常在数十到数百条 uop 量级；提交层则可看到「图节点数」与开销的关系——例如 CUDA Graphs 在 10 / 100 / 1025 节点等规模上测量 instantiation 与 repeat launch 的 CPU 开销，并在较新驱动上把直线 kernel 图的 repeat launch 压到近乎常数时间（约 2.5 μs + ~1 ns/节点量级）[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/)。这支撑的是「图规模会影响调度/提交路径」，而非某一颗 AI 芯的记分牌深度公式。
+需要分清两层：**调度窗口是 device 侧**（记分牌 / 就绪集 / 在途 op）的容量问题；SIMT GPU 上常见的细粒度 launch、CUDA Graphs 等，主要影响的是 **host 如何把工作提交到设备**，并不等于把「图级动态调度窗」做大。公开规格里也很少直接给出「窗深 = N 个 op」。下文「图太小」里的 Graphs / PDL，是**提交与跨核重叠**上的互补手段，用来减轻域被切碎后的症状，而不是调度窗口本身的定量证据。
 
 ### 1. 图太小：并发度不够
 
-细粒度小算子 launch 下，核内仍可调度，但**跨算子**并行与流水不足；依赖链被切开时更明显。数据流路线多靠编译器做大子图再映射。放大有效域的手段可互补：
+细粒度小算子 launch 下，核内仍可调度，但**跨算子**并行与流水不足；依赖链被切开时更明显。数据流路线多靠编译器做大子图再映射。放大有效域的手段可互补（融合才直接扩大 device 侧同域可见的工作；后两行偏提交/跨核层）：
 
 | 手段 | 作用 | 局限 |
 |---|---|---|
 | **融合 / 子图放大** | 多 op 进入同一调度域 | 实现难；过大可能超窗 |
-| **CUDA Graphs 等**[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，利于无依赖重叠 | 不等于更大的 op 级调度窗（也不融合 kernel body） |
-| **PDL 等依赖核重叠**[[3]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 压依赖边界气泡、提高 prefetch | 域仍碎；需较新硬件（如 CC 9.0+） |
+| **CUDA Graphs 等**[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，降低 host 侧反复 launch 开销，利于无依赖重叠 | 属 host/驱动提交模型；不扩大 device 记分牌，也不融合 kernel body |
+| **PDL 等依赖核重叠**[[3]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 依赖核可提前做无关工作、压边界气泡 | 仍是多 kernel 域；需较新硬件（如 CC 9.0+） |
 
 ### 2. 图太大：编译可得，窗口会超
 
@@ -156,7 +156,7 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 ## 参考
 
 1. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
-2. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；含多节点规模下的 launch/instantiation 开销）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
+2. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
 3. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
 4. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
 5. PyTorch, *Reducing torch.compile cold start… with regional compilation*（2024-10）. https://docs.pytorch.org/tutorials/recipes/regional_compilation.html  
@@ -164,4 +164,4 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 7. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
 8. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
 
-> （注：部分内容可能由 AI 生成；链接以公开页面为准，[7][8] 具时效性。AI 加速器很少公开「图级调度窗深度 = N」的规格，[2] 提供的是提交层图规模与开销的旁证。）
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，[7][8] 具时效性。厂商很少公开「图级调度窗深度 = N」；[2] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。）
