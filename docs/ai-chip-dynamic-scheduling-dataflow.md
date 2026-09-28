@@ -22,13 +22,15 @@
 > 数据流 = 静态编译框架 + 受限动态调度  
 > 乱序一类 = 弱拓扑约束 + 高自由度、高开销动态调度
 
-二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。TPU 一类设计即少做 cache / 分支预测 / 乱序，把晶体管更多留给矩阵与片上缓冲；相对同期 CPU/GPU，论文报道推理约 15–30×、TOPS/W 约 30–80×[[1]](https://arxiv.org/pdf/1704.04760)。
+二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。光谱更靠静态一端的近例是 Groq TSP：去掉 arbiter/cache 等反应式部件，由编译器在编译期做 cycle 级编排，执行具确定性；并可把这种确定性扩展到多芯片互连上的显式调度[[1]](https://groq.com/groq-at-isca-2022/)。
 
-两者都依赖调度，因而都碰到：**调度器一次能看见、能挖的有效计算图有多大？**
+两者都依赖「有效工作如何进入有限调度/执行资源」，因而都碰到：**一次能看见、能挖的有效计算图有多大？**
 
 ## 二、调度窗口与计算图大小
 
 调度窗口指一次处于「可调度 / 在途」的**指令或 op** 范围（有别于 shared mem / 显存等存储上限），深度多在微架构或编译器内部，开发者不易直接看见。有效图宜落在窗口能吃饱、软硬件又扛得住的区间。
+
+公开材料里，**「图级调度窗 = N 个 op」这类厂商规格很少直接给出**。更常见的定量是旁证：CPU 乱序的指令窗通常在数十到数百条 uop 量级；提交层则可看到「图节点数」与开销的关系——例如 CUDA Graphs 在 10 / 100 / 1025 节点等规模上测量 instantiation 与 repeat launch 的 CPU 开销，并在较新驱动上把直线 kernel 图的 repeat launch 压到近乎常数时间（约 2.5 μs + ~1 ns/节点量级）[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/)。这支撑的是「图规模会影响调度/提交路径」，而非某一颗 AI 芯的记分牌深度公式。
 
 ### 1. 图太小：并发度不够
 
@@ -37,7 +39,7 @@
 | 手段 | 作用 | 局限 |
 |---|---|---|
 | **融合 / 子图放大** | 多 op 进入同一调度域 | 实现难；过大可能超窗 |
-| **CUDA Graphs 等**[[2]](https://developer.nvidia.com/blog/cuda-graphs/) | 一次提交多节点，利于无依赖重叠 | 不等于更大的 op 级调度窗（也不融合 kernel body） |
+| **CUDA Graphs 等**[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，利于无依赖重叠 | 不等于更大的 op 级调度窗（也不融合 kernel body） |
 | **PDL 等依赖核重叠**[[3]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 压依赖边界气泡、提高 prefetch | 域仍碎；需较新硬件（如 CC 9.0+） |
 
 ### 2. 图太大：编译可得，窗口会超
@@ -71,7 +73,7 @@
 
 **链式依赖、共享片上 SRAM** 的串行算子宜同块或邻块。若只按「无依赖」拆散链条，中间结果易下刷 DDR，放大访存代价。
 
-> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前。例如 FlashAttention 用 tiling 与融合减少 HBM 往返，GPT-2 上可达约 7.6× 加速[[4]](https://arxiv.org/abs/2205.14135)。
+> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前（融合后减少中间下刷，是常见辅助手段之一[[4]](https://arxiv.org/abs/2205.14135)）。
 
 这样的块由谁来构造——手写，还是编译器融合？
 
@@ -85,7 +87,7 @@
 
 2. **编译器融合**
 
-自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。业界自动构图的一条近路径是 `torch.compile`：官方称多数模型可期待约 30%–2× 量级加速，核心仍是 fusion[[5]](https://pytorch.org/blog/pytorch-2.0-release/)。
+自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。近例是把编译范围收成重复区块（regional compilation），以降低整图过大带来的冷启动编译成本，同时尽量保住运行加速[[5]](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)。
 
 二者互补：热点手写，长尾与切分/换代靠编译。构图交给软件后，还要问：软件扛多少复杂度，硬件换回多少能效与密度？
 
@@ -153,13 +155,13 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 
 ## 参考
 
-1. Jouppi et al., *In-Datacenter Performance Analysis of a Tensor Processing Unit*, ISCA 2017. https://arxiv.org/pdf/1704.04760  
-2. NVIDIA, *Getting Started with CUDA Graphs*. https://developer.nvidia.com/blog/cuda-graphs/  
+1. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
+2. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；含多节点规模下的 launch/instantiation 开销）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
 3. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
-4. Dao et al., *FlashAttention*. https://arxiv.org/abs/2205.14135  
-5. PyTorch, *PyTorch 2.0*. https://pytorch.org/blog/pytorch-2.0-release/  
+4. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
+5. PyTorch, *Reducing torch.compile cold start… with regional compilation*（2024-10）. https://docs.pytorch.org/tutorials/recipes/regional_compilation.html  
 6. Aminabadi et al., *DeepSpeed Inference*. https://ar5iv.labs.arxiv.org/html/2207.00032  
 7. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
 8. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
 
-> （注：部分内容可能由 AI 生成；链接以公开页面为准，[7][8] 具时效性。）
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，[7][8] 具时效性。AI 加速器很少公开「图级调度窗深度 = N」的规格，[2] 提供的是提交层图规模与开销的旁证。）
