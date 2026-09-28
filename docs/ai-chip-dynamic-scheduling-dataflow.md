@@ -54,24 +54,16 @@
 
 ### 2. 图太大：编译可得，窗口会超
 
-整图或近整图可以编译，但时间、依赖分析、动态 shape、增量更新成本高。若要求海量 op **同时**待在窗口里，就绪与在途状态会胀。数据流芯片上，这层「窗」往往还与编译期资源预算叠在一起——片上 SRAM、PE / 阵列一次可配容量、确定性时间表长度等，装不下就要切。超限后常见处理（可组合）：
+整图或近整图可以编译，但时间、依赖分析、动态 shape、增量更新成本高。若要求海量 op **同时**待在窗口里，就绪与在途状态会胀。数据流芯片上，这层「窗」往往还与编译期资源预算叠在一起——片上 SRAM、PE / 阵列一次可配容量、确定性时间表长度等，装不下就要切。超限后常见处理（可组合；与第一章光谱对照）：
 
-| 手段 | 做法 | 要点 |
-|---|---|---|
-| **一次装得下就装** | 融合域 op 数 ≤ 窗口 / 资源预算 | 域够小时最省事 |
-| **静态切块 / 换配置** | 按预算切开，块间同步或换映射再装下一块 | 换 PE / 阵列配置时尤重；偏静态一端更常见 |
-| **同流内屏障 / 时空分期** | 长流中插 sync 或按相位分批准入 | 不必整图重 launch；跨屏障或跨相位无法再同窗调度 |
-| **滑动窗口** | 完成后滑、新 op 连续准入 | CPU 乱序经典做法；AI 数据流上较少作全图主路径 |
+| 手段 | 做法 | 芯片近例 | 边界 / 例外 |
+|---|---|---|---|
+| **一次装得下就装** | 融合域 op 数 ≤ 窗口 / 资源预算 | 各路线在子图够小时的默认路径 | 稍一超预算就要改切；动态 shape 易把「刚好装下」打穿 |
+| **静态切块 / 换配置** | 按预算切开，块间同步或换映射再装下一块 | **Groq**：编译期 Inter-op / Intra-op 切分，子图间以中间激活衔接，多芯片再切[[3]](https://groq.com/groq-at-isca-2022/)。**SN40L**：整图超阵列一次可配容量时，编成多个 temporal section，section 间换配置再装[[5]](https://arxiv.org/abs/2405.07518) | 块间切开并行与局部性；换 PE / 阵列配置时代价高于单纯插 sync；偏静态一端更常走此路 |
+| **同流内屏障 / 时空分期** | 长流中插 sync，或按相位分批准入 | **M100**：space-time 调度把大张量切成 mini-tensor，按时空相位流过 TPB；生产者–消费者同步，必要时屏障[[4]](https://arxiv.org/abs/2604.17862)。**SN40L** section 内亦靠 token 流控分期推进 | 跨屏障 / 跨相位无法再同窗调度；相位切太碎则气泡升、切太粗则在途资源仍可能爆 |
+| **滑动窗口** | 完成后滑、新 op 连续准入 | 乱序 CPU 的主路径；AI 数据流上较少作全图默认 | 窗口结构本身面积与功耗高；与强编译约束的数据流路线不搭 |
 
-与第一章光谱对照，举例芯片公开叙述里能对上的切法大致是：
-
-| 光谱近例 | 更常碰到的超限 | 公开可见的切法 |
-|---|---|---|
-| **Groq TSP** | 确定性时间表 / 片上容量装不下整模 | 编译期 Inter-op、Intra-op 切分；子图间以中间激活衔接，多芯片再切[[3]](https://groq.com/groq-at-isca-2022/) |
-| **理想 M100** | 大张量或子图超出单次映射与在途资源 | space-time 调度把大张量切成 mini-tensor，按时空相位流过 TPB；生产者–消费者同步，必要时屏障[[4]](https://arxiv.org/abs/2604.17862) |
-| **SambaNova SN40L** | 整图超出片上可重构阵列一次可配容量 | 编译为多个 temporal section，section 间换配置再装；section 内流式推进，token 做流控与编排[[5]](https://arxiv.org/abs/2405.07518) |
-
-偏静态一端更常「切开再排死」；编排式更常「同流分期 + 就绪同步」；令牌 / 流式一端在 section 内跟令牌走，超阵列容量时仍要退回 section 级静切。同构长流、不必重映射时，插 sync 或相位分期往往够用；要换空间配置时，更接近静态切块。
+同构长流、不必重映射时，插 sync 或相位分期往往够用；要换空间配置时，更接近静态切块。偏静态一端更常「切开再排死」；编排式更常「同流分期 + 就绪同步」；令牌 / 流式一端在 section 内跟令牌走，超阵列容量时仍要退回 section 级静切。
 
 ### 3. 合适大小
 
@@ -175,9 +167,9 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 
 1. Tomasulo 算法与动态调度（乱序就绪发射；教科书口径见 Hennessy & Patterson, *Computer Architecture: A Quantitative Approach* 相关章节）. https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm  
 2. Dennis & Misunas, *A preliminary architecture for a basic data-flow processor*（ISCA 1975；操作数到齐才使能）. https://dl.acm.org/doi/pdf/10.1145/641675.642111  
-3. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
-4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100）。利用率约 82% 见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
-5. Prabhakar et al., *SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts*（MICRO 2024 / arXiv:2405.07518；流式可重构数据流与 token 同步）. https://arxiv.org/abs/2405.07518  
+3. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度；大图需 Inter-op、Intra-op 等编译期切分，亦见其公开 workshop 材料）. https://groq.com/groq-at-isca-2022/  
+4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100；含 space-time 调度与 mini-tensor 分期）。利用率约 82% 见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
+5. Prabhakar et al., *SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts*（MICRO 2024 / arXiv:2405.07518；流式可重构数据流与 token 同步；大图常按 temporal section 换配置装载）. https://arxiv.org/abs/2405.07518  
 6. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
 7. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
 8. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
