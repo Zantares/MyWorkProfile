@@ -2,27 +2,37 @@
 
 ## 一、动态调度与数据流：一体两面
 
-**动态调度**指运行时根据依赖与资源空闲决定何时发射。数据流是其中一类——**带编译期约束的受限动态调度**。
+教科书口径里，**动态调度**指硬件在运行时重排指令发射次序，以在保持数据依赖与异常行为的前提下减少停顿；Tomasulo 一类乱序是其经典实现——操作数与功能部件就绪后再发射，不必死守程序序[[1]](https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm)。**数据流**则更早把「就绪」立为第一原则：一条指令**仅当全部所需操作数到齐**才使能执行，由数据驱动而非程序计数器推进[[2]](https://dl.acm.org/doi/pdf/10.1145/641675.642111)。
 
-1. **广义动态调度（常以乱序执行为代表）**
+由此有一条直接因果：数据流的触发条件本身就是运行时对依赖就绪的判定——**按就绪决定何时执行**，这正是动态调度的核心。差别不在「动不动」，而在约束强弱：数据流多在编译期固定图拓扑与资源映射，运行时只在骨架内触发；广义乱序则弱化拓扑约束，靠重命名、记分牌与大窗口处理未知依赖、分支与不规则访存。故可写成：
 
-乱序执行是其在 CPU 流水线中的经典实现：编译器输出线性指令流，**不固定拓扑、不做资源绑定**；硬件靠重命名、记分牌、乱序窗口处理未知依赖、分支与不规则访存。通用性强，但调度逻辑面积、功耗与延迟高。
+> 数据流 = 带编译期约束的受限动态调度  
+> 乱序一类 = 弱拓扑约束 + 高自由度、高开销动态调度
 
-2. **AI 数据流（受限动态调度）**
+1. **广义动态调度（常以乱序为代表）的代价**
 
-编译期定骨架，运行时轻量触发：
+编译器输出线性指令流，**不固定拓扑、不做资源绑定**；通用性强，但调度结构的面积、功耗与延迟都不便宜。公开微架构研究里，Pentium 类设计若把物理寄存器做在 ROB 槽里，ROB 可占整芯功耗约 **27%**；且这类多端口结构的读往往要 **多于一拍**，拖累 IPC[[3]](https://dl.acm.org/doi/10.1145/514191.514202)。发射侧 wake-up 同样是能耗大户：对空项与已就绪操作数的无效唤醒本身就很贵；Folegnani 等给出的优化，仅 wake-up 一项节省就可到原处理器总能耗约 **15%** 量级，侧面说明未收敛时发射逻辑负担很重[[4]](https://dl.acm.org/doi/10.1145/379240.379266)。数字随工艺与微结构而变，但量级表明：高自由度动态调度不是「免费的通用性」。
 
-- 编译期：固化拓扑、通路、PE 映射；
-- 运行时：在骨架内就绪触发、负载均衡、消气泡。
+2. **AI 数据流：内部并不统一**
 
-内部并不统一：有的几乎排死时间表，有的保留令牌就绪；共同点是**强编译约束**，差别在运行时机动空间。
+公约数仍是「编译期定骨架，运行时轻量触发」：
+
+- 编译期：固化拓扑、通路、PE / 张量映射；
+- 运行时：在骨架内按就绪触发、同步与消气泡。
+
+但内部光谱很宽，约束强弱与自由度差别不小：
+
+| 近例 | 约束大致位置 | 运行时机动 |
+|---|---|---|
+| **Groq TSP** | 更靠静态一端 | 去掉 arbiter/cache 等反应式部件，编译器做 cycle 级编排，执行具确定性；并可扩到多芯片显式调度[[5]](https://groq.com/groq-at-isca-2022/) |
+| **理想 M100** | 中间：编排式数据流 | 编译–架构协同在张量粒度编排计算与搬移；指令按数据与同步条件就绪再下发，功能单元内保序、跨单元可乱序完成。自称 *orchestrated dataflow*，刻意在确定性与非确定性之间取折中，并把细粒度令牌机的复杂上收到编译器 / runtime[[6]](https://arxiv.org/abs/2604.17862) |
+| **经典令牌数据流** | 更靠「就绪即触发」 | 拓扑仍由数据流图给出，发射更直接跟令牌到达走 |
+
+共同点是**相对乱序，编译约束更强**；差别在运行时还留多少吸收抖动、消气泡的空间。M100 的公开叙述尤其说明：「数据流」不是铁板一块——同一名号下，可以从排死时间表，走到编排式就绪派发，再到更自由的令牌触发。
 
 3. **一体两面**
 
-> 数据流 = 静态编译框架 + 受限动态调度  
-> 乱序一类 = 弱拓扑约束 + 高自由度、高开销动态调度
-
-二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。光谱更靠静态一端的近例是 Groq TSP：去掉 arbiter/cache 等反应式部件，由编译器在编译期做 cycle 级编排，执行具确定性；并可把这种确定性扩展到多芯片互连上的显式调度[[1]](https://groq.com/groq-at-isca-2022/)。
+二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。
 
 两者都依赖「有效工作如何进入有限调度/执行资源」，因而都碰到：**一次能看见、能挖的有效计算图有多大？**
 
@@ -39,8 +49,8 @@
 | 手段 | 作用 | 局限 |
 |---|---|---|
 | **融合 / 子图放大** | 多 op 进入同一调度域 | 实现难；过大可能超窗 |
-| **CUDA Graphs 等**[[2]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，降低 host 侧反复 launch 开销，利于无依赖重叠 | 属 host/驱动提交模型；不扩大 device 记分牌，也不融合 kernel body |
-| **PDL 等依赖核重叠**[[3]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 依赖核可提前做无关工作、压边界气泡 | 仍是多 kernel 域；需较新硬件（如 CC 9.0+） |
+| **CUDA Graphs 等**[[7]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，降低 host 侧反复 launch 开销，利于无依赖重叠 | 属 host/驱动提交模型；不扩大 device 记分牌，也不融合 kernel body |
+| **PDL 等依赖核重叠**[[8]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 依赖核可提前做无关工作、压边界气泡 | 仍是多 kernel 域；需较新硬件（如 CC 9.0+） |
 
 ### 2. 图太大：编译可得，窗口会超
 
@@ -73,7 +83,7 @@
 
 **链式依赖、共享片上 SRAM** 的串行算子宜同块或邻块。若只按「无依赖」拆散链条，中间结果易下刷 DDR，放大访存代价。
 
-> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前（融合后减少中间下刷，是常见辅助手段之一[[4]](https://arxiv.org/abs/2205.14135)）。
+> **并行挖掘优先，存储局部性兜底**；memory-bound 时局部性往往更靠前（融合后减少中间下刷，是常见辅助手段之一[[9]](https://arxiv.org/abs/2205.14135)）。
 
 这样的块由谁来构造——手写，还是编译器融合？
 
@@ -87,7 +97,7 @@
 
 2. **编译器融合**
 
-自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。近例是把编译范围收成重复区块（regional compilation），以降低整图过大带来的冷启动编译成本，同时尽量保住运行加速[[5]](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)。
+自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。近例是把编译范围收成重复区块（regional compilation），以降低整图过大带来的冷启动编译成本，同时尽量保住运行加速[[10]](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)。
 
 二者互补：热点手写，长尾与切分/换代靠编译。构图交给软件后，还要问：软件扛多少复杂度，硬件换回多少能效与密度？
 
@@ -118,7 +128,7 @@
 
 ### 1. 集群在难什么
 
-大规模训练/推理的卡点常在存储分层、跨卡通信与并行气泡；例如 DeepSpeed Inference 讨论过 PP/通信、KV Cache 与 offload 等如何拖住出口性能[[6]](https://ar5iv.labs.arxiv.org/html/2207.00032)。单片利用率高，仍可能被跨卡等待或缓存不足拖住，系统层往往更重。
+大规模训练/推理的卡点常在存储分层、跨卡通信与并行气泡；例如 DeepSpeed Inference 讨论过 PP/通信、KV Cache 与 offload 等如何拖住出口性能[[11]](https://ar5iv.labs.arxiv.org/html/2207.00032)。单片利用率高，仍可能被跨卡等待或缓存不足拖住，系统层往往更重。
 
 ### 2. 单片能力在集群里扮演什么
 
@@ -136,7 +146,7 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 
 共识方向相近：**先在超节点内做大紧耦合的 Scale-up 域，再在域间 Scale-out**。下表依据约 2025–2026 年公开信息，细节以当时发布为准。
 
-| | 华为灵衢（UnifiedBus）及相关超节点[[7]](https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech) | 平头哥真武及超节点[[8]](https://developer.aliyun.com/article/1765525) |
+| | 华为灵衢（UnifiedBus）及相关超节点[[12]](https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech) | 平头哥真武及超节点[[13]](https://developer.aliyun.com/article/1765525) |
 |--|-----------------------------------|-------------------|
 | **公开时间点** | 2025 年 9 月全联接大会：发布并开放灵衢 2.0 等规范 | 2026 年 9 月云栖大会：真武 V900 与超节点相关更新 |
 | **主要对象** | 面向超节点的互联协议与参考架构 | AI 芯片与片间/超节点互联（如 ICN）及整机协同 |
@@ -148,20 +158,25 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 
 ## 简要回顾
 
-1. 动态调度与数据流一体两面：静态定框架，动态挖性能；场景化取舍。
+1. 数据流因「就绪触发」而属于受限动态调度，与乱序差在约束强弱；场景化取舍。
 2. 效能取决于有效图与窗口匹配，以及横向并行与纵向局部性；吃窗内调度收益须喂窗。
 3. 手写与编译器互补构图；软件负重、硬件解放，形态多样。
 4. 超节点下，单片是入场券，通信、存储与 Infra 常定出口上限；单片与集群宜一起设计。
 
 ## 参考
 
-1. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
-2. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
-3. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
-4. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
-5. PyTorch, *Reducing torch.compile cold start… with regional compilation*（2024-10）. https://docs.pytorch.org/tutorials/recipes/regional_compilation.html  
-6. Aminabadi et al., *DeepSpeed Inference*. https://ar5iv.labs.arxiv.org/html/2207.00032  
-7. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
-8. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
+1. Tomasulo 算法与动态调度（乱序就绪发射；教科书口径见 Hennessy & Patterson, *Computer Architecture: A Quantitative Approach* 相关章节）. https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm  
+2. Dennis & Misunas, *A preliminary architecture for a basic data-flow processor*（ISCA 1975；操作数到齐才使能）. https://dl.acm.org/doi/pdf/10.1145/641675.642111  
+3. Kucuk, Ponomarev & Ghose, *Low-complexity reorder buffer architecture*（ICS 2002；引用 ROB 约占 Pentium 类整芯功耗约 27%，且读常多于一拍）. https://dl.acm.org/doi/10.1145/514191.514202  
+4. Folegnani & González, *Energy-effective issue logic*（ISCA 2001；发射 wake-up 能耗与动态缩队列）. https://dl.acm.org/doi/10.1145/379240.379266  
+5. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
+6. Xie et al., *M100: An Orchestrated Dataflow Architecture Powering General AI Computing*（arXiv:2604.17862；理想马赫 M100 / 编排式数据流）. https://arxiv.org/abs/2604.17862  
+7. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
+8. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
+9. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
+10. PyTorch, *Reducing torch.compile cold start… with regional compilation*（2024-10）. https://docs.pytorch.org/tutorials/recipes/regional_compilation.html  
+11. Aminabadi et al., *DeepSpeed Inference*. https://ar5iv.labs.arxiv.org/html/2207.00032  
+12. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
+13. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
 
-> （注：部分内容可能由 AI 生成；链接以公开页面为准，[7][8] 具时效性。厂商很少公开「图级调度窗深度 = N」；[2] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。）
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，[12][13] 具时效性。厂商很少公开「图级调度窗深度 = N」；[7] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。[3][4] 功耗数字来自特定微结构研究，不宜外推为所有乱序核的固定比例。）
