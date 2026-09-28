@@ -38,36 +38,41 @@
 
 ## 二、调度窗口与计算图大小
 
-调度窗口指一次处于「可调度 / 在途」的**指令或 op** 范围（有别于 shared mem / 显存等存储上限），深度多在微架构或编译器内部，开发者不易直接看见。有效图宜落在窗口能吃饱、软硬件又扛得住的区间。
+调度窗口指 device 侧一次处于「可调度 / 在途」的**硬件调度单元**范围：CPU 乱序里通常是 decode / rename 之后的 **uop**（记分牌、issue queue、ROB 等相关结构按此计数）；加速器上则是各家 ISA 下的指令、向量或张量指令等。它有别于 shared mem / 显存等**存储上限**，也有别于框架图上的**上层算子**（Conv、MatMul…）——后者要经编译、融合展开后，才变成窗内可见的调度单元。窗深多藏在微架构或编译器内部，公开规格很少直接给出「窗深 = N」。
 
-需要分清两层：**调度窗口是 device 侧**（记分牌 / 就绪集 / 在途 op）的容量问题；SIMT GPU 上常见的细粒度 launch、CUDA Graphs 等，主要影响的是 **host 如何把工作提交到设备**，并不等于把「图级动态调度窗」做大。公开规格里也很少直接给出「窗深 = N 个 op」。下文「图太小」里的 Graphs / PDL，是**提交与跨核重叠**上的互补手段，用来减轻域被切碎后的症状，而不是调度窗口本身的定量证据。
+本章关心的是**调度与计算图如何匹配**：有效工作要落进窗才能被动态调度挖到；图太碎则窗吃不饱，图太大或片上资源先爆则要切。SIMT GPU 上常见的细粒度 launch、CUDA Graphs 等，主要影响 **host 如何把工作提交到设备**，并不等于把 device 侧调度窗做大。下文「图太小」里的 Graphs / PDL，是提交与跨核重叠上的互补手段，用来减轻域被切碎后的症状，而不是窗深的定量证据。
 
 ### 1. 图太小：并发度不够
 
-细粒度小算子 launch 下，核内仍可调度，但**跨算子**并行与流水不足；依赖链被切开时更明显。数据流路线多靠编译器做大子图再映射。放大有效域的手段可互补（融合才直接扩大 device 侧同域可见的工作；后两行偏提交/跨核层）：
+细粒度小算子 launch 下，核内仍可调度，但**跨算子**并行与流水不足；依赖链被切开时更明显。放大有效域的手段可互补（融合才直接扩大 device 侧同域可见的工作；后两行偏提交/跨核层）：
 
 | 手段 | 作用 | 局限 |
 |---|---|---|
-| **融合 / 子图放大** | 多 op 进入同一调度域 | 实现难；过大可能超窗 |
+| **融合 / 子图放大** | 多个上层算子进入同一调度域，展开后窗内可见的调度单元变多 | 实现难；过大可能超窗或超片上资源 |
 | **CUDA Graphs 等**[[6]](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/) | 一次提交多节点，降低 host 侧反复 launch 开销，利于无依赖重叠 | 属 host/驱动提交模型；不扩大 device 记分牌，也不融合 kernel body |
 | **PDL 等依赖核重叠**[[7]](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html) | 依赖核可提前做无关工作、压边界气泡 | 仍是多 kernel 域；需较新硬件（如 CC 9.0+） |
 
-### 2. 图太大：编译可得，窗口会超
+### 2. 图太大：装不下就要切
 
-整图或近整图可以编译，但时间、依赖分析、动态 shape、增量更新成本高。若要求海量 op **同时**待在窗口里，就绪与在途状态会胀。数据流芯片上，这层「窗」往往还与编译期资源预算叠在一起——片上 SRAM、PE / 阵列一次可配容量、确定性时间表长度等，装不下就要切。超限后常见处理（可组合；与第一章光谱对照）：
+整图或近整图可以编译，但时间、依赖分析、动态 shape、增量更新成本高。超限常见两类动因，切法形态相近，不宜混为一谈：
 
-| 手段 | 做法 | 芯片近例 | 边界 / 例外 |
+- **超窗**：展开后的调度单元若要求同时在途，就绪 / 在途状态会胀（乱序 CPU 上即 uop 窗深压力）；
+- **超片上资源**：SRAM、权重 / 激活峰值、PE / 阵列一次可配容量等先装不下——许多加速器公开的「分图」主要落在这里，而非公布了一个「窗深 = N」再按 N 去切。
+
+超限后常见处理（可组合）：
+
+| 手段 | 做法 | 芯片落地（及主因） | 边界 / 例外 |
 |---|---|---|---|
-| **一次装得下就装** | 融合域 op 数 ≤ 窗口 / 资源预算 | 各路线在子图够小时的默认路径 | 稍一超预算就要改切；动态 shape 易把「刚好装下」打穿 |
-| **静态切块 / 换配置** | 按预算切开，块间同步或换映射再装下一块 | **Groq**：编译期 Inter-op / Intra-op 切分，子图间以中间激活衔接，多芯片再切[[3]](https://groq.com/groq-at-isca-2022/)。**SN40L**：整图超阵列一次可配容量时，编成多个 temporal section，section 间换配置再装[[5]](https://arxiv.org/abs/2405.07518) | 块间切开并行与局部性；换 PE / 阵列配置时代价高于单纯插 sync；偏静态一端更常走此路 |
-| **同流内屏障 / 时空分期** | 长流中插 sync，或按相位分批准入 | **M100**：space-time 调度把大张量切成 mini-tensor，按时空相位流过 TPB；生产者–消费者同步，必要时屏障[[4]](https://arxiv.org/abs/2604.17862)。**SN40L** section 内亦靠 token 流控分期推进 | 跨屏障 / 跨相位无法再同窗调度；相位切太碎则气泡升、切太粗则在途资源仍可能爆 |
-| **滑动窗口** | 完成后滑、新 op 连续准入 | 乱序 CPU 的主路径；AI 数据流上较少作全图默认 | 窗口结构本身面积与功耗高；与强编译约束的数据流路线不搭 |
+| **一次装得下就装** | 子图展开后既进得了窗，又装得下片上资源 | 各路线在子图够小时的默认路径 | 稍一超预算就要改切；动态 shape 易把「刚好装下」打穿 |
+| **静态切块 / 换配置** | 按预算切开，块间同步或换映射再装下一块 | **Groq** Inter-op / Intra-op：公开材料强调压低片上权重与激活峰值（live state / SRAM），子图间以中间激活衔接，多芯片再切——**主因片上容量，而非 issue 窗深**[[3]](https://groq.com/groq-at-isca-2022/)。**SN40L** temporal section：整图超一次可配的阵列与片上缓冲时换配置再装——**同属资源 / 映射容量驱动**[[5]](https://arxiv.org/abs/2405.07518) | 块间切开并行与局部性；换映射代价高于单纯插 sync |
+| **同流内屏障 / 时空分期** | 长流中插 sync，或按相位分批准入，限制同时在途的工作量 | **乱序 CPU**：编译或运行时插屏障 / 分期，直接服务于 uop 窗深。**M100**：space-time 把大张量切成 mini-tensor 按相位流过 TPB，并配合生产者–消费者同步与屏障——公开叙述更偏**大张量与缓冲 / 映射的时空分期**，屏障同时收紧跨相位的同窗可见性[[4]](https://arxiv.org/abs/2604.17862) | 跨屏障 / 跨相位无法再同窗调度；相位切太碎则气泡升，切太粗则在途状态或缓冲仍可能爆 |
+| **滑动窗口** | 完成后滑出，新调度单元连续准入 | **乱序 CPU** 的主路径：按 uop 完成与提交滑动——**典型的窗深机制**；AI 加速器上较少作全图默认 | 窗口结构本身面积与功耗高；与强编译约束、弱运行时重排的路线不搭 |
 
-同构长流、不必重映射时，插 sync 或相位分期往往够用；要换空间配置时，更接近静态切块。偏静态一端更常「切开再排死」；编排式更常「同流分期 + 就绪同步」；令牌 / 流式一端在 section 内跟令牌走，超阵列容量时仍要退回 section 级静切。
+同构长流、不必重映射时，插 sync 或相位分期往往够用；要换空间配置时，更接近静态切块。落地时先分清卡点是窗深还是片上资源，再选切法。
 
 ### 3. 合适大小
 
-太小则调度挖不满；太大则切块、屏障或滑窗都会在边界上付出并行与局部性代价。常见做法是融合做大，再按预算切开或分期，使**窗口能吃饱、边界可控**。
+太小则窗内调度单元挖不满；太大则切块、屏障或滑窗都会在边界上付出并行与局部性代价。常见做法是融合做大上层图，再按窗深与片上资源预算切开或分期，使**窗能吃饱、边界可控**。
 
 若必须切块或分期，边界如何画——横向挖并行，纵向保局部性？
 
@@ -77,7 +82,7 @@
 
 1. **横向划分（并行维度）**
 
-把**无依赖、可并行**的算子聚到同一 BB，增大窗内可挖的并发。多 Stream / CUDA Graphs 等外层重叠属于粗粒度软件调度；窗内动态调度只作用于**窗口可见的指令/op**。横向打包是为了**喂窗**。超窗或资源紧时仍可用外层手段，但要吃到动态调度本身的收益，工作须进窗。
+把**无依赖、可并行**的上层算子聚到同一 BB，使展开后窗内可挖的调度单元变多。多 Stream / CUDA Graphs 等外层重叠属于粗粒度软件调度；窗内动态调度只作用于**窗口可见的调度单元**（uop / 指令等）。横向打包是为了**喂窗**。超窗或片上资源紧时仍可用外层手段，但要吃到动态调度本身的收益，工作须进窗。
 
 2. **纵向划分（快存局部性维度）**
 
@@ -93,11 +98,11 @@
 
 1. **手写大算子**
 
-把更多工作送进同一调度域，并在算法与访存结构上深挖。动态调度下，cycle 级手排时间表的收益变弱（发射由窗口按就绪决定）；仍常拉开差距的是算法、tiling 与多 stage / 双缓冲等显式结构。短板是成本高、难覆盖多模型；硬件或窗深一变，大算子往往要重新手工切分。
+把更多上层算子送进同一调度域，并在算法与访存结构上深挖。动态调度下，cycle 级手排时间表的收益变弱（发射由窗口按就绪决定）；仍常拉开差距的是算法、tiling 与多 stage / 双缓冲等显式结构。短板是成本高、难覆盖多模型；硬件窗深或片上资源预算一变，大算子往往要重新手工切分。
 
 2. **编译器融合**
 
-自动聚合小算子，按窗口等预算融合与切分，换代和超窗时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。近例是把编译范围收成重复区块（regional compilation），以降低整图过大带来的冷启动编译成本，同时尽量保住运行加速[[9]](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)。
+自动聚合小算子，按窗深与片上资源等预算融合与切分，换代和超限时更易重来。短板是软件复杂（切分、映射、依赖、动态 shape）；指令排序上差距易缩小，热点算法与流水仍常落后专家核。近例是把编译范围收成重复区块（regional compilation），以降低整图过大带来的冷启动编译成本，同时尽量保住运行加速[[9]](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)。
 
 二者互补：热点手写，长尾与切分/换代靠编译。构图交给软件后，还要问：软件扛多少复杂度，硬件换回多少能效与密度？
 
@@ -138,7 +143,7 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 - **可被组织的硬件**：HBM、片间互联、同步与集合通信原语，是集群底座；
 - **易被稀释的部分**：仅做窗内发射与局部融合，而上层切图与通信很粗时，出口上可能看不见。
 
-通信算子若以粗粒度插在图外（例如 host 侧集合通信后再启下一计算阶段），等于切开有效调度域，窗口看不见「计算 ↔ 通信」的细依赖。解法之一是**通算融合**：把通信做成 device 侧算子，或与计算同处一张可调度图 / 同一类 kernel，使调度窗口能看到通算上下文，从而重叠执行、按就绪发射。集群通信与访存复杂，完成时刻常有抖动；在窗口已能看见通算依赖的前提下，动态调度往往比排死的通算时间表更耐毛刺。节点失效、checkpoint 回滚等全局容错，仍主要靠作业与 runtime / Infra。
+通信算子若以粗粒度插在图外（例如 host 侧集合通信后再启下一计算阶段），等于切开有效调度域，窗口看不见「计算 ↔ 通信」展开后的细依赖。解法之一是**通算融合**：把通信做成 device 侧算子，或与计算同处一张可调度图 / 同一类 kernel，使调度窗口能看到通算上下文对应的调度单元，从而重叠执行、按就绪发射。集群通信与访存复杂，完成时刻常有抖动；在窗口已能看见通算依赖的前提下，动态调度往往比排死的通算时间表更耐毛刺。节点失效、checkpoint 回滚等全局容错，仍主要靠作业与 runtime / Infra。
 
 关键仍在层间接口：并行策略怎样少切断局部性，硬件提供何种同步与带宽，使集群用得上单片。
 
@@ -159,7 +164,7 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 ## 简要回顾
 
 1. 数据流因「就绪触发」而属于受限动态调度，与乱序差在约束强弱；场景化取舍。
-2. 效能取决于有效图与窗口匹配，以及横向并行与纵向局部性；吃窗内调度收益须喂窗。
+2. 效能取决于上层图展开后与窗深、片上资源的匹配，以及横向并行与纵向局部性；吃窗内调度收益须喂窗。
 3. 手写与编译器互补构图；软件负重、硬件解放，形态多样。
 4. 超节点下，单片是入场券，通信、存储与 Infra 常定出口上限；单片与集群宜一起设计。
 
@@ -167,9 +172,9 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 
 1. Tomasulo 算法与动态调度（乱序就绪发射；教科书口径见 Hennessy & Patterson, *Computer Architecture: A Quantitative Approach* 相关章节）. https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm  
 2. Dennis & Misunas, *A preliminary architecture for a basic data-flow processor*（ISCA 1975；操作数到齐才使能）. https://dl.acm.org/doi/pdf/10.1145/641675.642111  
-3. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度；大图需 Inter-op、Intra-op 等编译期切分，亦见其公开 workshop 材料）. https://groq.com/groq-at-isca-2022/  
-4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100；含 space-time 调度与 mini-tensor 分期）。利用率约 82% 见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
-5. Prabhakar et al., *SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts*（MICRO 2024 / arXiv:2405.07518；流式可重构数据流与 token 同步；大图常按 temporal section 换配置装载）. https://arxiv.org/abs/2405.07518  
+3. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP；大图 Inter-op / Intra-op 切分公开材料多指向片上 SRAM / live state）。https://groq.com/groq-at-isca-2022/  
+4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100；space-time 与 mini-tensor 分期）。利用率约 82% 见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
+5. Prabhakar et al., *SambaNova SN40L…*（MICRO 2024 / arXiv:2405.07518；temporal section 多由一次可配阵列与片上缓冲容量驱动）. https://arxiv.org/abs/2405.07518  
 6. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
 7. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
 8. Dao et al., *FlashAttention*（仅作「融合有助局部性」的辅助例）. https://arxiv.org/abs/2205.14135  
@@ -178,4 +183,4 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 11. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
 12. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
 
-> （注：部分内容可能由 AI 生成；链接以公开页面为准，[11][12] 具时效性。厂商很少公开「图级调度窗深度 = N」；[6] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。）
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，[11][12] 具时效性。调度窗按硬件调度单元计（CPU 上多为 uop）；厂商很少公开「窗深 = N」。[6] 只说明 Graphs 作为提交手段，不佐证 device 调度窗。Groq / SN40L 等公开分图叙述宜与片上资源约束对照阅读，不宜直接当作窗深证据。）
