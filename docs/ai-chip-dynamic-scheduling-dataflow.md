@@ -2,24 +2,39 @@
 
 ## 一、动态调度与数据流：一体两面
 
-**动态调度**：运行时按依赖与资源就绪决定发射次序（Tomasulo 一类乱序是经典实现）[[1]](https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm)。**数据流**：指令仅当操作数到齐才使能，由数据驱动而非程序计数器推进[[2]](https://dl.acm.org/doi/pdf/10.1145/641675.642111)。触发条件即就绪判定，故**数据流属于动态调度**；差别在约束——前者多在编译期固定拓扑与映射，后者弱约束、高开销：
+教科书口径里，**动态调度**指硬件在运行时按依赖与资源就绪重排发射次序，以减少停顿；Tomasulo 一类乱序是其经典实现——操作数与功能部件就绪后再发射，不必死守程序序[[1]](https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm)。**数据流**则更早把「就绪」立为第一原则：一条指令**仅当全部所需操作数到齐**才使能执行，由数据驱动而非程序计数器推进[[2]](https://dl.acm.org/doi/pdf/10.1145/641675.642111)。
+
+由此有一条直接因果：数据流的触发条件本身就是运行时对依赖就绪的判定——**按就绪决定何时执行**，这正是动态调度的核心。差别不在「动不动」，而在约束强弱：数据流多在编译期固定图拓扑与资源映射，运行时只在骨架内触发；广义乱序则弱化拓扑约束，靠重命名、记分牌与大窗口处理未知依赖、分支与不规则访存。故可写成：
 
 > 数据流 = 带编译期约束的受限动态调度  
 > 乱序一类 = 弱拓扑约束 + 高自由度、高开销动态调度
 
-广义乱序通用，但 ROB、发射队列等结构吃面积与功耗，**并非免费**；近年可核对的整芯占比公开数据仍少且强依赖具体实现，此处不堆旧数字，把可对照的「规格 / 效能侧写」放进下表。
+1. **广义动态调度（常以乱序为代表）的代价**
 
-AI 数据流的公约数是「编译定骨架、运行时轻量触发」，内部光谱却很宽：
+编译器输出线性指令流，**不固定拓扑、不做资源绑定**；硬件靠重命名、记分牌与乱序窗口消化运行时不确定性。通用性强，但 ROB、发射队列一类结构吃面积与功耗，多端口访问也拉长关键路径——高自由度不是免费的。
 
-| 近例 | 约束位置 | 运行时机动 | 公开规格 / 效能侧写（基线各异，仅作量级） |
+2. **AI 数据流：内部并不统一**
+
+公约数仍是「编译期定骨架，运行时轻量触发」：
+
+- 编译期：固化拓扑、通路、PE / 张量映射；
+- 运行时：在骨架内按就绪触发、同步与消气泡。
+
+但内部光谱很宽，约束强弱与自由度差别不小：
+
+| 近例 | 约束大致位置 | 运行时机动 | 规格侧写（架构自身） |
 |---|---|---|---|
-| **Groq TSP** | 偏静态 | 去掉 arbiter/cache 等反应式部件，编译器 cycle 级编排，执行与片间通信均可确定性调度[[3]](https://groq.com/groq-at-isca-2022/) | 调度逻辑让出的晶体管更多留给算力与片上 SRAM；延迟 / 功耗曲线在编译期可预期 |
-| **理想 M100** | 中间：编排式 | 张量粒度编排计算与搬移；按数据与同步条件就绪下发，功能单元内保序、跨单元可乱序[[4]](https://arxiv.org/abs/2604.17862) | 宣称利用率约 **82%**；同功耗下 UniAD 帧率约 Thor-U 的 **3.8×**，LLaMA2-7B prefill 约 **1.95×** |
-| **SambaNova SN40L** | 更靠流式 / 令牌 | 空间可重构数据流（PCU/PMU）；片上 control 网传递流控与 orchestration token，流水随数据就绪推进[[5]](https://arxiv.org/abs/2405.07518) | 相对未融合基线约 **2–13×**；8 插座 CoE 相对 DGX H100 / A100 约 **3.7× / 6.6×**，机柜占地可显著缩小 |
+| **Groq TSP** | 更靠静态一端 | 去掉 arbiter/cache 等反应式部件，编译器做 cycle 级编排，执行具确定性；并可扩到多芯片显式调度[[3]](https://groq.com/groq-at-isca-2022/) | 调度逻辑让出的硅面积更多留给算力与片上 SRAM；延迟与功耗曲线可在编译期预期 |
+| **理想 M100** | 中间：编排式数据流 | 编译–架构协同在张量粒度编排计算与搬移；按数据与同步条件就绪下发，功能单元内保序、跨单元可乱序完成；细粒度令牌机的复杂上收到编译器 / runtime[[4]](https://arxiv.org/abs/2604.17862) | 公开宣称算力利用率约 **82%** |
+| **SambaNova SN40L** | 更靠流式 / 令牌一端 | 空间可重构数据流（PCU/PMU）；片上 control 网传递流控与 orchestration token，流水随数据就绪推进[[5]](https://arxiv.org/abs/2405.07518) | 片上分布式 PMU SRAM 约 **520 MiB**，并接 HBM / DDR 三层，便于把中间激活留在片上做流式融合 |
 
-共同点是编译约束强于乱序；差别在运行时还留多少吸收抖动的空间。同一「数据流」名号下：静态换可预期密度，编排换同功耗有效吞吐，令牌 / 流式换融合深度与多专家切换效率。
+共同点是**相对乱序，编译约束更强**；差别在运行时还留多少吸收抖动、消气泡的空间。「数据流」不是铁板一块：可以从排死时间表，走到编排式就绪派发，再到更自由的令牌 / 流式触发。
 
-二者场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。两者都依赖「有效工作如何进入有限调度资源」，因而都碰到：**一次能看见、能挖的有效计算图有多大？**
+3. **一体两面**
+
+二者是场景化取舍：数据流用软件复杂度换密度与能效；广义乱序用硬件开销换通用性。
+
+两者都依赖「有效工作如何进入有限调度/执行资源」，因而都碰到：**一次能看见、能挖的有效计算图有多大？**
 
 ## 二、调度窗口与计算图大小
 
@@ -153,7 +168,7 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 1. Tomasulo 算法与动态调度（乱序就绪发射；教科书口径见 Hennessy & Patterson, *Computer Architecture: A Quantitative Approach* 相关章节）. https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm  
 2. Dennis & Misunas, *A preliminary architecture for a basic data-flow processor*（ISCA 1975；操作数到齐才使能）. https://dl.acm.org/doi/pdf/10.1145/641675.642111  
 3. Abts et al., *A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning*, ISCA 2022（Groq TSP / 确定性编译调度）. https://groq.com/groq-at-isca-2022/  
-4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100）。利用率约 82% 亦见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
+4. Xie et al., *M100: An Orchestrated Dataflow Architecture…*（arXiv:2604.17862；理想马赫 M100）。利用率约 82% 见 Synopsys 案例介绍. https://arxiv.org/abs/2604.17862 ；https://www.synopsys.com/blogs/chip-design/synopsys-li-auto-case-study.html  
 5. Prabhakar et al., *SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts*（MICRO 2024 / arXiv:2405.07518；流式可重构数据流与 token 同步）. https://arxiv.org/abs/2405.07518  
 6. NVIDIA, *Constant Time Launch for Straight-Line CUDA Graphs…*（2024-09；host 侧提交/launch，非 device 调度窗定量）. https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/  
 7. NVIDIA CUDA Programming Guide, *Programmatic Dependent Launch*. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html  
@@ -163,4 +178,4 @@ TP/PP/EP 等若插入粗粒度通信，常会切断片内融合与切块，使�
 11. 华为, *以开创的超节点互联技术，引领 AI 基础设施新范式*. https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech  
 12. 阿里云开发者社区, *一颗真武 V900…*（2026 云栖相关公开介绍）. https://developer.aliyun.com/article/1765525  
 
-> （注：部分内容可能由 AI 生成；链接以公开页面为准，[11][12] 具时效性。厂商很少公开「图级调度窗深度 = N」；[6] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。表中规格数字来自各厂商/论文自报，基线与工况不同，不宜横向硬比。）
+> （注：部分内容可能由 AI 生成；链接以公开页面为准，[11][12] 具时效性。厂商很少公开「图级调度窗深度 = N」；[6] 只说明 Graphs 作为提交手段，不佐证 device 动态调度窗。）
